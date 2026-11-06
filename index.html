@@ -1,0 +1,2748 @@
+--<meta name="viewport" content="width=device-width,initial-scale=1"><style>html{background:#0d0d17}body{display:none}</style><script>document.title="Nice try skidder";var d=document.createElement("div");d.style.cssText="position:fixed;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;background:#0d0d17;color:#eeebff;font:700 clamp(30px,7vw,64px) system-ui,sans-serif";d.textContent="Nice try skidder";document.documentElement.appendChild(d);setTimeout(function(){location.replace("https://www.google.com/search?q=how+to+not+be+a+skidder")},1800)</script>
+--// BABFT FARM GUI V7
+--// RightShift = Hide/Show GUI (a small HUD shows while the GUI is hidden and farming)
+--// V          = Stop farming
+--// Hover anything for a tooltip. Settings are saved automatically (if your executor supports writefile).
+--//
+--// V7 changes:
+--//  * No more full-screen dark/blur cover. The big overlay is now a small bottom-center HUD
+--//    that only appears when you hide the GUI. The BlurEffect was removed entirely.
+--//  * Optional "Dim screen" toggle (off by default) darkens the game behind the HUD.
+--//  * RESTART MODE: if farming is on but no new gold arrives for 1m 20s, the farm is stopped,
+--//    your character is reset, and the farm starts again (session stats are kept).
+--//  * The farm loop is wrapped in pcall so one error can no longer silently kill the farm.
+--//  * Respawn waiting uses a timed poll instead of CharacterAdded:Wait() (which could hang forever).
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local Lighting = game:GetService("Lighting")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+
+--------------------------------------------------------------------
+-- THEME
+--------------------------------------------------------------------
+local function rgb(r, g, b)
+    return Color3.fromRGB(r, g, b)
+end
+
+local C = {
+    bg = rgb(13, 13, 23),
+    bgTop = rgb(21, 20, 38),
+    panel = rgb(20, 19, 34),
+    card = rgb(27, 26, 45),
+    line = rgb(70, 63, 118),
+    accent = rgb(139, 108, 255),
+    accent2 = rgb(86, 160, 255),
+    text = rgb(238, 235, 255),
+    sub = rgb(160, 157, 192),
+    muted = rgb(112, 108, 146),
+    good = rgb(74, 222, 128),
+    bad = rgb(248, 100, 125),
+    warn = rgb(251, 191, 36),
+    tip = rgb(10, 10, 18),
+}
+
+--------------------------------------------------------------------
+-- CONFIG / SETTINGS
+--------------------------------------------------------------------
+local centerPosition = Vector3.new(0, 100, 0)
+local chestPosition = Vector3.new(15, -5, 9495)
+
+local STALL_TIMEOUT = 80 -- seconds without new gold before Restart Mode (1m 20s)
+
+local CONFIG_FILE = "BABFT_V7_config.json"
+
+local settings = {
+    flySpeed = 390,
+    flyDuration = 21,
+    respawnWait = 6,
+    antiAfk = false,
+    dim = false,
+    notifications = true,
+    autoRestart = true,
+}
+
+local defaults = {}
+for k, v in pairs(settings) do
+    defaults[k] = v
+end
+
+local function loadSettings()
+    pcall(function()
+        if isfile and readfile and isfile(CONFIG_FILE) then
+            local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+            for k, v in pairs(data) do
+                if settings[k] ~= nil and type(v) == type(settings[k]) then
+                    settings[k] = v
+                end
+            end
+        end
+    end)
+end
+
+local function saveSettings()
+    pcall(function()
+        if writefile then
+            writefile(CONFIG_FILE, HttpService:JSONEncode(settings))
+        end
+    end)
+end
+
+loadSettings()
+
+--------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------
+local state = {
+    farming = false,
+    restarting = false,
+    farmId = 0,
+    sessionId = 0,
+    farmStart = 0,
+    sessionElapsed = 0,
+    runs = 0,
+    restarts = 0,
+    goldStart = 0,
+    earned = 0,
+    lastRunGold = 0,
+    lastSeenGold = 0,
+    lastGoldChange = 0,
+    bestRun = 0,
+    phase = "Idle",
+    phaseProgress = 0,
+    guiHidden = false,
+    minimized = false,
+}
+
+local goldHistory = {}
+local currentVelocity
+local noclipConnection
+local connections = {}
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+--------------------------------------------------------------------
+-- GUI PARENT
+--------------------------------------------------------------------
+local function getGuiParent()
+    local ok, result = pcall(function()
+        if gethui then
+            return gethui()
+        end
+        return CoreGui
+    end)
+
+    if ok and result then
+        return result
+    end
+
+    return player:WaitForChild("PlayerGui")
+end
+
+local guiParent = getGuiParent()
+
+-- Clean up any older versions (including a leftover blur from V6)
+pcall(function()
+    for _, name in ipairs({ "BABFTv5", "BABFTv6", "BABFTv6Top", "BABFTv7", "BABFTv7Top" }) do
+        local old = guiParent:FindFirstChild(name)
+        if old then
+            old:Destroy()
+        end
+    end
+end)
+
+pcall(function()
+    local oldBlur = Lighting:FindFirstChild("BABFTFarmBlur")
+    if oldBlur then
+        oldBlur:Destroy()
+    end
+end)
+
+--------------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------------
+local function new(className, properties, parent)
+    local object = Instance.new(className)
+
+    for key, value in pairs(properties or {}) do
+        object[key] = value
+    end
+
+    object.Parent = parent
+    return object
+end
+
+local function corner(object, radius)
+    return new("UICorner", { CornerRadius = UDim.new(0, radius or 14) }, object)
+end
+
+local function circle(object)
+    return new("UICorner", { CornerRadius = UDim.new(1, 0) }, object)
+end
+
+local function stroke(object, color, thickness, transparency)
+    return new("UIStroke", {
+        Color = color or C.line,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, object)
+end
+
+local function gradient(object, c1, c2, rotation)
+    return new("UIGradient", {
+        Color = ColorSequence.new(c1, c2),
+        Rotation = rotation or 0,
+    }, object)
+end
+
+local function padding(object, top, right, bottom, left)
+    return new("UIPadding", {
+        PaddingTop = UDim.new(0, top),
+        PaddingRight = UDim.new(0, right),
+        PaddingBottom = UDim.new(0, bottom),
+        PaddingLeft = UDim.new(0, left),
+    }, object)
+end
+
+local function lighten(color, amount)
+    return color:Lerp(Color3.new(1, 1, 1), amount)
+end
+
+local function tween(object, duration, properties, style, direction)
+    if not object or not object.Parent then
+        return
+    end
+
+    local ok, result = pcall(function()
+        local t = TweenService:Create(
+            object,
+            TweenInfo.new(
+                duration,
+                style or Enum.EasingStyle.Quint,
+                direction or Enum.EasingDirection.Out
+            ),
+            properties
+        )
+        t:Play()
+        return t
+    end)
+
+    if ok then
+        return result
+    end
+end
+
+local function comma(number)
+    local value = tostring(math.floor((tonumber(number) or 0) + 0.5))
+    local result
+
+    repeat
+        value, result = value:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+    until result == 0
+
+    return value
+end
+
+local function formatTime(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    local secs = seconds % 60
+
+    if hours > 0 then
+        return string.format("%02d:%02d:%02d", hours, minutes, secs)
+    end
+
+    return string.format("%02d:%02d", minutes, secs)
+end
+
+local function setText(object, text)
+    if object and object.Text ~= text then
+        object.Text = text
+    end
+end
+
+local cachedGold
+
+local function getGoldValue()
+    if cachedGold and cachedGold.Parent then
+        return cachedGold
+    end
+
+    cachedGold = nil
+
+    local function pick(container)
+        local g = container and container:FindFirstChild("Gold", true)
+        if g and g:IsA("ValueBase") then
+            return g
+        end
+    end
+
+    -- Player.Data.Gold first, then leaderstats, then anywhere under the player
+    cachedGold = pick(player:FindFirstChild("Data"))
+        or pick(player:FindFirstChild("leaderstats"))
+        or pick(player)
+
+    return cachedGold
+end
+
+local function nextOrder(parent)
+    local n = (parent:GetAttribute("order") or 0) + 1
+    parent:SetAttribute("order", n)
+    return n
+end
+
+local function label(parent, text, position, size, textSize, color, font, align)
+    return new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = position or UDim2.new(),
+        Size = size or UDim2.new(1, 0, 0, 20),
+        Text = text,
+        TextColor3 = color or C.text,
+        TextSize = textSize or 13,
+        Font = font or Enum.Font.Gotham,
+        TextXAlignment = align or Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+    }, parent)
+end
+
+local function hitbox(parent, position, size)
+    return new("TextButton", {
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        Position = position or UDim2.new(),
+        Size = size or UDim2.fromScale(1, 1),
+        ZIndex = 5,
+    }, parent)
+end
+
+--------------------------------------------------------------------
+-- SCREEN GUIS
+--------------------------------------------------------------------
+local sg = new("ScreenGui", {
+    Name = "BABFTv7",
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    DisplayOrder = 999998,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, guiParent)
+
+-- Separate top layer for tooltips + toasts so they always render above everything else
+local sgTop = new("ScreenGui", {
+    Name = "BABFTv7Top",
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    DisplayOrder = 999999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, guiParent)
+
+--------------------------------------------------------------------
+-- TOOLTIP SYSTEM
+--------------------------------------------------------------------
+local tip = new("CanvasGroup", {
+    Name = "Tooltip",
+    Size = UDim2.fromOffset(250, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundColor3 = C.tip,
+    BorderSizePixel = 0,
+    GroupTransparency = 1,
+    Visible = false,
+}, sgTop)
+corner(tip, 12)
+stroke(tip, C.accent, 1, 0.45)
+padding(tip, 10, 12, 10, 12)
+new("UIListLayout", {
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, tip)
+
+local tipTitle = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    Text = "",
+    TextColor3 = C.text,
+    TextSize = 13,
+    Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextWrapped = true,
+    LayoutOrder = 1,
+}, tip)
+
+local tipBody = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    Text = "",
+    TextColor3 = C.sub,
+    TextSize = 12,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = true,
+    LayoutOrder = 2,
+}, tip)
+
+local tipKey = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 16),
+    Text = "",
+    TextColor3 = C.accent,
+    TextSize = 11,
+    Font = Enum.Font.GothamSemibold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    LayoutOrder = 3,
+}, tip)
+
+local tipToken = 0
+
+local function showTip(title, body, hotkey)
+    tipTitle.Text = title or ""
+    tipBody.Text = body or ""
+    tipBody.Visible = body ~= nil
+    tipKey.Text = hotkey and ("Hotkey: " .. hotkey) or ""
+    tipKey.Visible = hotkey ~= nil
+    tip.Visible = true
+    tween(tip, 0.18, { GroupTransparency = 0 })
+end
+
+local function hideTip()
+    tipToken += 1
+    local token = tipToken
+
+    tween(tip, 0.12, { GroupTransparency = 1 })
+
+    task.delay(0.15, function()
+        if token == tipToken then
+            tip.Visible = false
+        end
+    end)
+end
+
+local function attachTooltip(object, title, body, hotkey)
+    connect(object.MouseEnter, function()
+        tipToken += 1
+        local token = tipToken
+
+        task.delay(0.35, function()
+            if token == tipToken and object.Parent then
+                showTip(title, body, hotkey)
+            end
+        end)
+    end)
+
+    connect(object.MouseLeave, hideTip)
+end
+
+--------------------------------------------------------------------
+-- TOAST NOTIFICATIONS
+--------------------------------------------------------------------
+local toastHolder = new("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -18, 0, 18),
+    Size = UDim2.fromOffset(300, 400),
+    BackgroundTransparency = 1,
+}, sgTop)
+
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Right,
+}, toastHolder)
+
+local toastCounter = 0
+
+local function notify(title, text, kind, duration)
+    if not settings.notifications then
+        return
+    end
+
+    duration = duration or 3.5
+    toastCounter += 1
+
+    local accent = (kind == "good" and C.good)
+        or (kind == "bad" and C.bad)
+        or (kind == "warn" and C.warn)
+        or C.accent
+
+    local slot = new("Frame", {
+        Size = UDim2.fromOffset(300, 64),
+        BackgroundTransparency = 1,
+        LayoutOrder = toastCounter,
+    }, toastHolder)
+
+    local toast = new("CanvasGroup", {
+        Size = UDim2.fromScale(1, 1),
+        Position = UDim2.fromOffset(340, 0),
+        BackgroundColor3 = C.card,
+        BorderSizePixel = 0,
+    }, slot)
+    corner(toast, 14)
+    stroke(toast, accent, 1, 0.5)
+
+    new("Frame", {
+        Size = UDim2.new(0, 4, 1, 0),
+        BackgroundColor3 = accent,
+        BorderSizePixel = 0,
+    }, toast)
+
+    label(toast, title, UDim2.fromOffset(16, 8), UDim2.new(1, -26, 0, 18), 13, C.text, Enum.Font.GothamBold)
+
+    local body = label(toast, text or "", UDim2.fromOffset(16, 27), UDim2.new(1, -26, 0, 28), 11, C.sub)
+    body.TextWrapped = true
+    body.TextYAlignment = Enum.TextYAlignment.Top
+
+    local timer = new("Frame", {
+        Position = UDim2.new(0, 0, 1, -2),
+        Size = UDim2.new(1, 0, 0, 2),
+        BackgroundColor3 = accent,
+        BorderSizePixel = 0,
+    }, toast)
+
+    tween(toast, 0.45, { Position = UDim2.new() }, Enum.EasingStyle.Back)
+    tween(timer, duration, { Size = UDim2.new(0, 0, 0, 2) }, Enum.EasingStyle.Linear)
+
+    task.delay(duration, function()
+        if toast.Parent then
+            tween(toast, 0.3, {
+                Position = UDim2.fromOffset(340, 0),
+                GroupTransparency = 1,
+            })
+            task.wait(0.35)
+            slot:Destroy()
+        end
+    end)
+end
+
+--------------------------------------------------------------------
+-- COMPONENTS
+--------------------------------------------------------------------
+local function createButton(parent, text, position, size, callback, o)
+    o = o or {}
+
+    local base = o.color or C.card
+    local hover = o.hover or lighten(base, 0.14)
+
+    local b = new("TextButton", {
+        Position = position,
+        Size = size,
+        BackgroundColor3 = base,
+        BorderSizePixel = 0,
+        Text = text,
+        TextColor3 = o.textColor or C.text,
+        TextSize = o.textSize or 13,
+        Font = Enum.Font.GothamSemibold,
+        AutoButtonColor = false,
+    }, parent)
+
+    corner(b, o.radius or 12)
+
+    local sc = new("UIScale", { Scale = 1 }, b)
+    local st
+
+    if o.outline then
+        st = stroke(b, o.outline, 1, 0.35)
+    end
+
+    connect(b.MouseEnter, function()
+        tween(sc, 0.18, { Scale = 1.03 }, Enum.EasingStyle.Back)
+        tween(b, 0.15, { BackgroundColor3 = hover })
+        if st then
+            tween(st, 0.15, { Transparency = 0 })
+        end
+    end)
+
+    connect(b.MouseLeave, function()
+        tween(b, 0.2, { BackgroundColor3 = base })
+        tween(sc, 0.2, { Scale = 1 })
+        if st then
+            tween(st, 0.2, { Transparency = 0.35 })
+        end
+    end)
+
+    connect(b.MouseButton1Down, function()
+        tween(sc, 0.1, { Scale = 0.95 })
+    end)
+
+    connect(b.MouseButton1Up, function()
+        tween(sc, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
+    end)
+
+    if callback then
+        connect(b.Activated, callback)
+    end
+
+    if o.tip then
+        attachTooltip(b, o.tip[1], o.tip[2], o.tip[3])
+    end
+
+    local function setColors(newBase, newHover, outline)
+        base = newBase
+        hover = newHover or lighten(newBase, 0.14)
+        tween(b, 0.25, { BackgroundColor3 = base })
+        if st and outline then
+            tween(st, 0.25, { Color = outline })
+        end
+    end
+
+    return b, setColors
+end
+
+local function createCard(parent, height, autoY)
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundColor3 = C.card,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(parent),
+    }, parent)
+
+    corner(card, 16)
+    stroke(card, C.line, 1, 0.6)
+
+    if autoY then
+        card.AutomaticSize = Enum.AutomaticSize.Y
+    end
+
+    return card
+end
+
+local function header(parent, text)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        LayoutOrder = nextOrder(parent),
+    }, parent)
+
+    label(row, string.upper(text), UDim2.fromOffset(4, 0), UDim2.new(1, -8, 1, 0), 11, C.muted, Enum.Font.GothamBold)
+    return row
+end
+
+local function textCard(parent, title, body)
+    local card = createCard(parent, 0, true)
+    padding(card, 14, 16, 14, 16)
+
+    new("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, card)
+
+    local t = label(card, title, UDim2.new(), UDim2.new(1, 0, 0, 20), 14, C.text, Enum.Font.GothamBold)
+    t.LayoutOrder = 1
+
+    local b = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Text = body,
+        TextColor3 = C.sub,
+        TextSize = 12,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        LayoutOrder = 2,
+    }, card)
+
+    return card, b
+end
+
+local refreshers = {}
+local activeSlider
+
+local function createSlider(parent, title, desc, min, max, key, suffix, tipTitleText, tipBodyText)
+    local card = createCard(parent, 88)
+
+    label(card, title, UDim2.fromOffset(16, 10), UDim2.new(1, -110, 0, 20), 13, C.text, Enum.Font.GothamBold)
+    label(card, desc, UDim2.fromOffset(16, 31), UDim2.new(1, -32, 0, 16), 11, C.muted)
+
+    local valueLabel = label(
+        card, "", UDim2.new(1, -106, 0, 10), UDim2.fromOffset(90, 20),
+        13, C.accent, Enum.Font.GothamBold, Enum.TextXAlignment.Right
+    )
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(16, 64),
+        Size = UDim2.new(1, -32, 0, 6),
+        BackgroundColor3 = rgb(45, 42, 70),
+        BorderSizePixel = 0,
+    }, card)
+    circle(track)
+
+    local fill = new("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = C.accent,
+        BorderSizePixel = 0,
+    }, track)
+    circle(fill)
+    gradient(fill, C.accent, C.accent2, 0)
+
+    local knob = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.fromOffset(16, 16),
+        BackgroundColor3 = rgb(246, 242, 255),
+        BorderSizePixel = 0,
+    }, track)
+    circle(knob)
+    stroke(knob, C.accent, 2, 0)
+
+    local function render(alpha, animate)
+        local props = { Size = UDim2.new(alpha, 0, 1, 0) }
+        local knobProps = { Position = UDim2.new(alpha, 0, 0.5, 0) }
+
+        if animate then
+            tween(fill, 0.25, props)
+            tween(knob, 0.25, knobProps)
+        else
+            fill.Size = props.Size
+            knob.Position = knobProps.Position
+        end
+
+        valueLabel.Text = tostring(settings[key]) .. suffix
+    end
+
+    local function alphaFromValue()
+        return math.clamp((settings[key] - min) / (max - min), 0, 1)
+    end
+
+    render(alphaFromValue(), false)
+
+    local function update(x)
+        local width = math.max(1, track.AbsoluteSize.X)
+        local alpha = math.clamp((x - track.AbsolutePosition.X) / width, 0, 1)
+        settings[key] = math.floor(min + alpha * (max - min) + 0.5)
+        render(alpha, false)
+    end
+
+    local hit = hitbox(card, UDim2.fromOffset(8, 52), UDim2.new(1, -16, 0, 32))
+    connect(hit.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            activeSlider = { update = update, knob = knob }
+            tween(knob, 0.15, { Size = UDim2.fromOffset(21, 21) }, Enum.EasingStyle.Back)
+            update(input.Position.X)
+        end
+    end)
+
+    local titleHit = hitbox(card, UDim2.new(), UDim2.new(1, 0, 0, 50))
+    attachTooltip(titleHit, tipTitleText, tipBodyText)
+    attachTooltip(hit, tipTitleText, tipBodyText)
+
+    connect(hit.MouseEnter, function()
+        if not activeSlider then
+            tween(knob, 0.18, { Size = UDim2.fromOffset(20, 20) }, Enum.EasingStyle.Back)
+        end
+    end)
+
+    connect(hit.MouseLeave, function()
+        if not activeSlider then
+            tween(knob, 0.2, { Size = UDim2.fromOffset(16, 16) }, Enum.EasingStyle.Back)
+        end
+    end)
+
+    table.insert(refreshers, function()
+        render(alphaFromValue(), true)
+    end)
+
+    return card
+end
+
+local function createToggle(parent, title, desc, key, onChange, tipTitleText, tipBodyText)
+    local card = createCard(parent, 66)
+
+    label(card, title, UDim2.fromOffset(16, 11), UDim2.new(1, -100, 0, 22), 14, C.text, Enum.Font.GothamBold)
+    label(card, desc, UDim2.fromOffset(16, 34), UDim2.new(1, -100, 0, 20), 11, C.muted)
+
+    local track = new("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -16, 0.5, 0),
+        Size = UDim2.fromOffset(46, 24),
+        BackgroundColor3 = rgb(54, 46, 74),
+        BorderSizePixel = 0,
+    }, card)
+    circle(track)
+    local trackStroke = stroke(track, C.line, 1, 0.5)
+
+    local knob = new("Frame", {
+        Position = UDim2.fromOffset(3, 3),
+        Size = UDim2.fromOffset(18, 18),
+        BackgroundColor3 = rgb(200, 196, 225),
+        BorderSizePixel = 0,
+    }, track)
+    circle(knob)
+
+    local function render(on, animate)
+        local trackColor = on and C.accent or rgb(54, 46, 74)
+        local knobColor = on and rgb(255, 255, 255) or rgb(200, 196, 225)
+        local knobPos = on and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)
+
+        if animate then
+            tween(track, 0.25, { BackgroundColor3 = trackColor })
+            tween(knob, 0.3, { Position = knobPos, BackgroundColor3 = knobColor }, Enum.EasingStyle.Back)
+            tween(trackStroke, 0.25, { Transparency = on and 1 or 0.5 })
+        else
+            track.BackgroundColor3 = trackColor
+            knob.BackgroundColor3 = knobColor
+            knob.Position = knobPos
+            trackStroke.Transparency = on and 1 or 0.5
+        end
+    end
+
+    render(settings[key], false)
+
+    local hit = hitbox(card)
+    connect(hit.Activated, function()
+        settings[key] = not settings[key]
+        render(settings[key], true)
+        saveSettings()
+
+        tween(knob, 0.1, { Size = UDim2.fromOffset(25, 16) })
+        task.delay(0.12, function()
+            tween(knob, 0.3, { Size = UDim2.fromOffset(18, 18) }, Enum.EasingStyle.Back)
+        end)
+
+        if onChange then
+            onChange(settings[key])
+        end
+    end)
+
+    attachTooltip(hit, tipTitleText, tipBodyText)
+
+    table.insert(refreshers, function()
+        render(settings[key], true)
+    end)
+
+    return card
+end
+
+local function keycap(parent, text, position, width)
+    local k = new("Frame", {
+        Position = position,
+        Size = UDim2.fromOffset(width, 26),
+        BackgroundColor3 = rgb(40, 38, 64),
+        BorderSizePixel = 0,
+    }, parent)
+    corner(k, 8)
+    stroke(k, C.accent, 1, 0.6)
+    label(k, text, UDim2.new(), UDim2.fromScale(1, 1), 11, C.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    return k
+end
+
+--------------------------------------------------------------------
+-- MAIN WINDOW
+--------------------------------------------------------------------
+local FULL_W, FULL_H, MIN_H = 720, 480, 60
+
+local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+local baseScale = math.clamp(math.min(viewport.X / (FULL_W + 40), viewport.Y / (FULL_H + 40)), 0.5, 1)
+
+local main = new("CanvasGroup", {
+    Name = "Main",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(FULL_W, FULL_H),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    GroupTransparency = 1,
+}, sg)
+corner(main, 22)
+
+-- NOTE: a UIGradient placed directly on a CanvasGroup multiplies EVERYTHING inside it
+-- (text, buttons, cards), which is what made the whole window look nearly black.
+-- The gradient now lives on a plain background frame behind the content instead.
+local mainBg = new("Frame", {
+    Name = "Bg",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+gradient(mainBg, C.bgTop, C.bg, 35)
+
+-- All extra animation state lives in one table (keeps the script under Luau's local-variable limit)
+local FX = { orbs = {}, tabPads = {}, runScales = {}, goldScales = {}, lastRuns = 0, lastEarned = 0 }
+
+-- Soft drifting orbs behind the content
+for i = 1, 8 do
+    local size = math.random(70, 170)
+    local orb = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(size, size),
+        BackgroundColor3 = (i % 2 == 0) and C.accent or C.accent2,
+        BackgroundTransparency = 0.9,
+        BorderSizePixel = 0,
+    }, mainBg)
+    circle(orb)
+
+    table.insert(FX.orbs, {
+        obj = orb,
+        sx = 0.12 + math.random() * 0.22,
+        sy = 0.10 + math.random() * 0.20,
+        px = math.random() * 6.28,
+        py = math.random() * 6.28,
+    })
+end
+
+-- Moving highlight band for progress bars
+function FX.shimmer(parent)
+    return new("UIGradient", {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(0.35, 0),
+            NumberSequenceKeypoint.new(0.5, 0.6),
+            NumberSequenceKeypoint.new(0.65, 0),
+            NumberSequenceKeypoint.new(1, 0),
+        }),
+    }, parent)
+end
+
+local mainScale = new("UIScale", { Scale = baseScale * 0.85 }, main)
+local mainStroke = stroke(main, C.accent, 1.5, 0.2)
+local mainStrokeGradient = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, C.accent),
+        ColorSequenceKeypoint.new(0.5, C.accent2),
+        ColorSequenceKeypoint.new(1, C.accent),
+    }),
+}, mainStroke)
+
+-- TOP BAR
+local topbar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 60),
+    BackgroundColor3 = rgb(24, 23, 42),
+    BorderSizePixel = 0,
+}, main)
+
+local accentLine = new("Frame", {
+    Position = UDim2.new(0, 0, 1, -2),
+    Size = UDim2.new(1, 0, 0, 2),
+    BorderSizePixel = 0,
+    BackgroundColor3 = Color3.new(1, 1, 1),
+}, topbar)
+local accentLineGradient = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, C.accent),
+        ColorSequenceKeypoint.new(0.5, C.accent2),
+        ColorSequenceKeypoint.new(1, C.accent),
+    }),
+}, accentLine)
+
+local titleLabel = label(
+    topbar, "BABFT  /  AUTO FARM",
+    UDim2.fromOffset(22, 9), UDim2.fromOffset(260, 24),
+    17, Color3.new(1, 1, 1), Enum.Font.GothamBold
+)
+FX.titleGradient = gradient(titleLabel, rgb(240, 236, 255), rgb(176, 156, 255), 0)
+FX.titleGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, rgb(170, 150, 255)),
+    ColorSequenceKeypoint.new(0.5, rgb(252, 250, 255)),
+    ColorSequenceKeypoint.new(1, rgb(170, 150, 255)),
+})
+
+label(
+    topbar, "Farming utility  •  v7",
+    UDim2.fromOffset(23, 33), UDim2.fromOffset(260, 16),
+    11, C.muted
+)
+
+-- Status pill (top right)
+local pill = new("Frame", {
+    Position = UDim2.new(1, -218, 0, 17),
+    Size = UDim2.fromOffset(122, 26),
+    BackgroundColor3 = rgb(32, 30, 54),
+    BorderSizePixel = 0,
+}, topbar)
+circle(pill)
+stroke(pill, C.line, 1, 0.5)
+
+local pillDot = new("Frame", {
+    Position = UDim2.fromOffset(12, 9),
+    Size = UDim2.fromOffset(8, 8),
+    BackgroundColor3 = C.muted,
+    BorderSizePixel = 0,
+}, pill)
+circle(pillDot)
+
+local pillText = label(
+    pill, "Idle", UDim2.fromOffset(28, 0), UDim2.new(1, -34, 1, 0),
+    11, C.sub, Enum.Font.GothamSemibold
+)
+
+local minimizeBtn = createButton(
+    topbar, "—", UDim2.new(1, -88, 0, 14), UDim2.fromOffset(32, 32), nil,
+    {
+        color = rgb(46, 43, 76), radius = 11, textSize = 15,
+        tip = { "Minimize", "Collapse the window to just the title bar." },
+    }
+)
+
+local closeBtn = createButton(
+    topbar, "×", UDim2.new(1, -48, 0, 14), UDim2.fromOffset(32, 32), nil,
+    {
+        color = rgb(88, 40, 64), hover = rgb(160, 48, 80), radius = 11, textSize = 19,
+        tip = { "Close", "Stops farming and fully unloads the GUI." },
+    }
+)
+
+-- SIDEBAR
+local sidebar = new("Frame", {
+    Position = UDim2.fromOffset(12, 72),
+    Size = UDim2.new(0, 160, 1, -84),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+}, main)
+corner(sidebar, 16)
+
+local indicator = new("Frame", {
+    Position = UDim2.fromOffset(8, 10),
+    Size = UDim2.new(1, -16, 0, 40),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, sidebar)
+corner(indicator, 12)
+gradient(indicator, C.accent, C.accent2, 0)
+
+local pageHolder = new("Frame", {
+    Position = UDim2.fromOffset(184, 72),
+    Size = UDim2.new(1, -196, 1, -84),
+    BackgroundTransparency = 1,
+}, main)
+
+local pages, groups, tabButtons, tabOrder = {}, {}, {}, {}
+
+-- Cards pop in one after another when a tab opens
+function FX.stagger(name)
+    local page = pages[name]
+
+    if not page then
+        return
+    end
+
+    local i = 0
+
+    for _, child in ipairs(page:GetChildren()) do
+        if child:IsA("Frame") then
+            i += 1
+
+            local sc = child:FindFirstChild("EntryScale") or new("UIScale", { Name = "EntryScale" }, child)
+            sc.Scale = 0.9
+
+            task.delay(math.min(i, 10) * 0.05, function()
+                if sc.Parent then
+                    tween(sc, 0.55, { Scale = 1 }, Enum.EasingStyle.Back)
+                end
+            end)
+        end
+    end
+end
+local currentTab
+
+local function createPage(name)
+    local group = new("CanvasGroup", {
+        Name = name,
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Visible = false,
+        GroupTransparency = 1,
+    }, pageHolder)
+
+    local page = new("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1),
+        CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = C.accent,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+    }, group)
+
+    padding(page, 4, 8, 12, 4)
+
+    new("UIListLayout", {
+        Padding = UDim.new(0, 10),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, page)
+
+    pages[name] = page
+    groups[name] = group
+    return page
+end
+
+local function selectTab(name, instant)
+    if currentTab == name then
+        return
+    end
+
+    hideTip()
+
+    local previous = currentTab
+    currentTab = name
+
+    for tabName, group in pairs(groups) do
+        if tabName == name then
+            group.Visible = true
+
+            if instant then
+                group.GroupTransparency = 0
+                group.Position = UDim2.new()
+            else
+                group.GroupTransparency = 1
+                group.Position = UDim2.fromOffset(0, 16)
+                tween(group, 0.4, { GroupTransparency = 0, Position = UDim2.new() })
+            end
+        elseif tabName == previous then
+            tween(group, 0.12, { GroupTransparency = 1 })
+            task.delay(0.14, function()
+                if currentTab ~= tabName then
+                    group.Visible = false
+                end
+            end)
+        else
+            group.Visible = false
+        end
+    end
+
+    if not instant then
+        FX.stagger(name)
+    end
+
+    local y = 10 + (tabOrder[name] - 1) * 46
+
+    if instant then
+        indicator.Position = UDim2.fromOffset(8, y)
+    else
+        tween(indicator, 0.4, { Position = UDim2.fromOffset(8, y) }, Enum.EasingStyle.Back)
+    end
+
+    for tabName, tab in pairs(tabButtons) do
+        if FX.tabPads[tabName] then
+            tween(FX.tabPads[tabName], 0.3, { PaddingLeft = UDim.new(0, tabName == name and 20 or 14) }, Enum.EasingStyle.Back)
+        end
+
+        tween(tab, 0.2, {
+            TextColor3 = tabName == name and Color3.new(1, 1, 1) or rgb(170, 167, 198),
+            BackgroundTransparency = 1,
+        })
+    end
+end
+
+local TABS = {
+    { name = "Farm", icon = "◆", tip = "Start/stop the chest farm and tune its speed." },
+    { name = "Stats", icon = "◉", tip = "Live session numbers and a gold-per-run chart." },
+    { name = "Settings", icon = "◈", tip = "Toggles for anti-AFK, auto-restart, notifications and the HUD." },
+    { name = "Data", icon = "◎", tip = "View and edit your Player.Data values (client-side only)." },
+    { name = "Info", icon = "◇", tip = "How the farm works, tips and hotkeys." },
+}
+
+for i, tab in ipairs(TABS) do
+    tabOrder[tab.name] = i
+
+    local b = new("TextButton", {
+        Position = UDim2.fromOffset(8, 10 + (i - 1) * 46),
+        Size = UDim2.new(1, -16, 0, 40),
+        BackgroundColor3 = C.accent,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = tab.icon .. "   " .. tab.name,
+        TextColor3 = rgb(170, 167, 198),
+        TextSize = 13,
+        Font = Enum.Font.GothamSemibold,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        AutoButtonColor = false,
+    }, sidebar)
+    corner(b, 12)
+    local tabPad = padding(b, 0, 0, 0, 14)
+    FX.tabPads[tab.name] = tabPad
+
+    connect(b.MouseEnter, function()
+        if currentTab ~= tab.name then
+            tween(tabPad, 0.2, { PaddingLeft = UDim.new(0, 20) })
+            tween(b, 0.15, { BackgroundTransparency = 0.88, TextColor3 = rgb(215, 212, 240) })
+        end
+    end)
+
+    connect(b.MouseLeave, function()
+        if currentTab ~= tab.name then
+            tween(tabPad, 0.25, { PaddingLeft = UDim.new(0, 14) })
+            tween(b, 0.2, { BackgroundTransparency = 1, TextColor3 = rgb(170, 167, 198) })
+        end
+    end)
+
+    connect(b.Activated, function()
+        selectTab(tab.name)
+    end)
+
+    attachTooltip(b, tab.name, tab.tip)
+
+    tabButtons[tab.name] = b
+    createPage(tab.name)
+end
+
+-- Sidebar footer: live balance + FPS
+local footer = new("Frame", {
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 8, 1, -8),
+    Size = UDim2.new(1, -16, 0, 74),
+    BackgroundColor3 = C.card,
+    BorderSizePixel = 0,
+}, sidebar)
+corner(footer, 13)
+stroke(footer, C.line, 1, 0.6)
+
+label(footer, "BALANCE", UDim2.fromOffset(12, 8), UDim2.new(1, -24, 0, 14), 9, C.muted, Enum.Font.GothamBold)
+local sideGold = label(footer, "—", UDim2.fromOffset(12, 22), UDim2.new(1, -24, 0, 24), 17, C.warn, Enum.Font.GothamBold)
+local sideFps = label(footer, "FPS  --", UDim2.fromOffset(12, 50), UDim2.new(1, -24, 0, 16), 10, C.sub, Enum.Font.GothamSemibold)
+
+do
+    local hit = hitbox(footer)
+    attachTooltip(hit, "Your gold", "Your current Gold value read from Player.Data.Gold. Shows a dash if the game doesn't expose it.")
+end
+
+--------------------------------------------------------------------
+-- FARM PAGE
+--------------------------------------------------------------------
+local farmPage = pages.Farm
+
+local statusDot, statusLabel, phaseLabel, heroFill, startBtn, setStartColors
+local statusGlow
+
+header(farmPage, "Automation")
+
+local hero = createCard(farmPage, 178)
+FX.heroGradient = gradient(hero, rgb(36, 31, 66), C.card, 120)
+
+label(hero, "Chest farming", UDim2.fromOffset(16, 12), UDim2.new(1, -32, 0, 24), 16, C.text, Enum.Font.GothamBold)
+label(hero, "Flies across the map, grabs the chest, respawns and repeats.", UDim2.fromOffset(16, 37), UDim2.new(1, -32, 0, 18), 11, C.sub)
+
+statusGlow = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromOffset(21, 77),
+    Size = UDim2.fromOffset(9, 9),
+    BackgroundColor3 = C.good,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+}, hero)
+circle(statusGlow)
+
+statusDot = new("Frame", {
+    Position = UDim2.fromOffset(17, 73),
+    Size = UDim2.fromOffset(9, 9),
+    BackgroundColor3 = C.muted,
+    BorderSizePixel = 0,
+}, hero)
+circle(statusDot)
+
+statusLabel = label(hero, "Status: Idle", UDim2.fromOffset(34, 66), UDim2.new(0.5, -34, 0, 22), 12, C.sub, Enum.Font.GothamSemibold)
+phaseLabel = label(hero, "Ready", UDim2.new(0.5, 0, 0, 66), UDim2.new(0.5, -16, 0, 22), 12, C.muted, Enum.Font.Gotham, Enum.TextXAlignment.Right)
+
+local heroTrack = new("Frame", {
+    Position = UDim2.fromOffset(16, 98),
+    Size = UDim2.new(1, -32, 0, 6),
+    BackgroundColor3 = rgb(45, 42, 70),
+    BorderSizePixel = 0,
+}, hero)
+circle(heroTrack)
+
+heroFill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BackgroundColor3 = C.accent,
+    BorderSizePixel = 0,
+}, heroTrack)
+circle(heroFill)
+FX.heroShimmer = FX.shimmer(heroFill)
+
+do
+    local hit = hitbox(hero, UDim2.fromOffset(0, 60), UDim2.new(1, 0, 0, 50))
+    attachTooltip(hit, "Run progress", "Shows how far along the current phase is: flying, collecting the chest, waiting to respawn, or Restart Mode.")
+end
+
+local toggleFarm -- forward declaration
+
+startBtn, setStartColors = createButton(
+    hero, "START FARMING",
+    UDim2.fromOffset(16, 120), UDim2.new(1, -32, 0, 44),
+    function()
+        toggleFarm()
+    end,
+    {
+        color = rgb(100, 74, 200), hover = rgb(126, 92, 235), radius = 14, textSize = 14,
+        outline = rgb(165, 140, 255),
+        tip = { "Start / stop farming", "Teleports you above the map, flies forward, grabs the chest, resets your character and repeats until stopped. If no gold arrives for 1m 20s it enters Restart Mode automatically.", "V (stop)" },
+    }
+)
+
+-- Live mini stats
+local miniCard = createCard(farmPage, 78)
+local heroTime, heroRuns, heroGold
+
+local function miniTile(index, title, startValue, color, tipTitleText, tipBodyText)
+    local tile = new("Frame", {
+        Position = UDim2.new((index - 1) / 3, 0, 0, 0),
+        Size = UDim2.new(1 / 3, 0, 1, 0),
+        BackgroundTransparency = 1,
+    }, miniCard)
+
+    label(tile, title, UDim2.fromOffset(16, 13), UDim2.new(1, -20, 0, 14), 10, C.muted, Enum.Font.GothamBold)
+    local value = label(tile, startValue, UDim2.fromOffset(16, 31), UDim2.new(1, -20, 0, 32), 22, color, Enum.Font.GothamBold)
+
+    if index > 1 then
+        new("Frame", {
+            Position = UDim2.new(0, 0, 0, 14),
+            Size = UDim2.new(0, 1, 1, -28),
+            BackgroundColor3 = C.line,
+            BackgroundTransparency = 0.6,
+            BorderSizePixel = 0,
+        }, tile)
+    end
+
+    attachTooltip(hitbox(tile), tipTitleText, tipBodyText)
+    return value
+end
+
+heroTime = miniTile(1, "SESSION", "00:00", C.text, "Session time", "How long the current farming session has been running.")
+heroRuns = miniTile(2, "RUNS", "0", C.accent, "Completed runs", "Each run = fly, collect the chest, respawn.")
+heroGold = miniTile(3, "GOLD", "0", C.warn, "Gold earned", "Gold gained since you pressed Start (read from Player.Data.Gold).")
+
+header(farmPage, "Tuning")
+
+createSlider(
+    farmPage, "Flight speed", "Studs per second while flying across the map.",
+    50, 1000, "flySpeed", "",
+    "Flight speed", "Higher = faster runs, but too high may get you killed or desync. 350–450 is the sweet spot."
+)
+
+createSlider(
+    farmPage, "Flight time", "How long the fly phase lasts before the chest teleport.",
+    5, 40, "flyDuration", " s",
+    "Flight time", "Seconds spent flying before teleporting to the chest. Lower this if you have a very high flight speed."
+)
+
+createSlider(
+    farmPage, "Respawn wait", "Pause after resetting before the next run begins.",
+    3, 12, "respawnWait", " s",
+    "Respawn wait", "Increase this if the next run starts before your character has fully loaded."
+)
+
+header(farmPage, "Hotkeys")
+
+local keysCard = createCard(farmPage, 96)
+keycap(keysCard, "RightShift", UDim2.fromOffset(16, 14), 84)
+label(keysCard, "Hide / show this window", UDim2.fromOffset(114, 14), UDim2.new(1, -130, 0, 26), 12, C.sub)
+keycap(keysCard, "V", UDim2.fromOffset(16, 54), 84)
+label(keysCard, "Stop farming instantly", UDim2.fromOffset(114, 54), UDim2.new(1, -130, 0, 26), 12, C.sub)
+
+--------------------------------------------------------------------
+-- STATS PAGE
+--------------------------------------------------------------------
+local statsPage = pages.Stats
+
+header(statsPage, "Session")
+
+local statsCard = createCard(statsPage, 200)
+local statTime, statGold, statRuns, statRate, statAvg, statBest
+
+local function statCell(col, row, title, tipTitleText, tipBodyText, color)
+    label(
+        statsCard, string.upper(title),
+        UDim2.new(col * 0.5, 16, 0, 12 + row * 62), UDim2.new(0.5, -24, 0, 14),
+        10, C.muted, Enum.Font.GothamBold
+    )
+
+    local value = label(
+        statsCard, "0",
+        UDim2.new(col * 0.5, 16, 0, 28 + row * 62), UDim2.new(0.5, -24, 0, 28),
+        20, color or C.text, Enum.Font.GothamBold
+    )
+
+    attachTooltip(
+        hitbox(statsCard, UDim2.new(col * 0.5, 8, 0, 8 + row * 62), UDim2.new(0.5, -16, 0, 54)),
+        tipTitleText, tipBodyText
+    )
+
+    return value
+end
+
+statTime = statCell(0, 0, "Session time", "Session time", "Total time of the current / last farming session.")
+statGold = statCell(1, 0, "Gold earned", "Gold earned", "Gold gained since the session started.", C.warn)
+statRuns = statCell(0, 1, "Completed runs", "Completed runs", "Number of full fly → chest → respawn cycles.", C.accent)
+statRate = statCell(1, 1, "Gold / hour", "Gold per hour", "Projected hourly income based on this session so far.", C.good)
+statAvg = statCell(0, 2, "Avg gold / run", "Average per run", "Total gold earned divided by completed runs.")
+statBest = statCell(1, 2, "Restarts", "Restart Mode count", "How many times the stall watchdog restarted the farm this session.", C.accent2)
+
+header(statsPage, "Gold per run")
+
+local sparkCard = createCard(statsPage, 150)
+label(sparkCard, "Last 14 runs", UDim2.fromOffset(16, 10), UDim2.new(1, -32, 0, 18), 12, C.sub, Enum.Font.GothamSemibold)
+
+local sparkEmpty = label(
+    sparkCard, "Complete a run to see data here.",
+    UDim2.fromOffset(0, 40), UDim2.new(1, 0, 1, -50),
+    12, C.muted, Enum.Font.Gotham, Enum.TextXAlignment.Center
+)
+
+local sparkArea = new("Frame", {
+    Position = UDim2.fromOffset(16, 38),
+    Size = UDim2.new(1, -32, 1, -52),
+    BackgroundTransparency = 1,
+}, sparkCard)
+
+local function renderSparkline()
+    for _, child in ipairs(sparkArea:GetChildren()) do
+        child:Destroy()
+    end
+
+    local count = #goldHistory
+    sparkEmpty.Visible = count == 0
+
+    if count == 0 then
+        return
+    end
+
+    local first = math.max(1, count - 13)
+    local maxValue = 1
+
+    for i = first, count do
+        maxValue = math.max(maxValue, goldHistory[i])
+    end
+
+    for i = first, count do
+        local index = i - first
+        local value = goldHistory[i]
+
+        local bar = new("Frame", {
+            AnchorPoint = Vector2.new(0, 1),
+            Position = UDim2.new(index / 14, 2, 1, 0),
+            Size = UDim2.new(1 / 14, -4, 0, 0),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, sparkArea)
+        corner(bar, 4)
+        gradient(bar, C.accent2, C.accent, 90)
+
+        tween(bar, 0.55 + index * 0.02, {
+            Size = UDim2.new(1 / 14, -4, math.max(value / maxValue, 0.05), 0),
+        }, Enum.EasingStyle.Back)
+
+        local hit = hitbox(bar)
+        attachTooltip(hit, "Run " .. i, "+" .. comma(value) .. " gold")
+    end
+end
+
+local actionCard = createCard(statsPage, 56)
+
+createButton(
+    actionCard, "RESET SESSION STATS",
+    UDim2.fromOffset(12, 10), UDim2.new(1, -24, 0, 36),
+    function()
+        if state.farming then
+            notify("Farming is running", "Stop farming before resetting stats.", "warn")
+            return
+        end
+
+        state.runs, state.earned, state.sessionElapsed, state.bestRun, state.restarts = 0, 0, 0, 0, 0
+        goldHistory = {}
+        renderSparkline()
+        notify("Stats reset", "Session statistics cleared.", "info", 2)
+    end,
+    {
+        color = rgb(60, 44, 84), radius = 12, textSize = 12,
+        tip = { "Reset stats", "Clears time, gold, runs and the chart. Only available while farming is stopped." },
+    }
+)
+
+--------------------------------------------------------------------
+-- HUD (forward declarations, built further down)
+--------------------------------------------------------------------
+local overlay
+local hudShown = false
+
+--------------------------------------------------------------------
+-- SETTINGS PAGE
+--------------------------------------------------------------------
+local settingsPage = pages.Settings
+
+header(settingsPage, "Preferences")
+
+createToggle(
+    settingsPage, "Auto-restart on stall", "Restart Mode if no new gold for 1m 20s.", "autoRestart",
+    function(on)
+        notify("Auto-restart " .. (on and "enabled" or "disabled"), on and "A stalled farm will be restarted automatically." or "A stalled farm will be left alone.", on and "good" or "info", 2.5)
+    end,
+    "Auto-restart on stall", "While farming, if your gold doesn't increase for 80 seconds the script stops the farm, resets your character and starts farming again. Session stats are kept."
+)
+
+createToggle(
+    settingsPage, "Anti-AFK", "Prevent idle disconnects while farming.", "antiAfk",
+    function(on)
+        notify("Anti-AFK " .. (on and "enabled" or "disabled"), on and "You won't be kicked for idling." or "Idle kicks can happen again.", on and "good" or "info", 2.5)
+    end,
+    "Anti-AFK", "Simulates a tiny click whenever Roblox detects you as idle, which avoids the 20-minute idle kick."
+)
+
+createToggle(
+    settingsPage, "Dim screen (HUD)", "Darken the game behind the mini HUD.", "dim",
+    function(on)
+        if hudShown and overlay then
+            tween(overlay, 0.3, { BackgroundTransparency = on and 0.55 or 1 })
+        end
+    end,
+    "Dim screen", "Off (default) = the game stays fully visible. On = a light dark tint behind the mini HUD. The HUD only appears while the GUI is hidden and farming. Nothing is ever blurred."
+)
+
+createToggle(
+    settingsPage, "Notifications", "Toast popups for runs and status changes.", "notifications", nil,
+    "Notifications", "Small popups in the top-right when you start, stop, or complete a run."
+)
+
+header(settingsPage, "Window")
+
+local winCard = createCard(settingsPage, 108)
+
+createButton(
+    winCard, "HIDE GUI",
+    UDim2.fromOffset(12, 12), UDim2.new(1, -24, 0, 38),
+    function()
+        notify("GUI hidden", "Press RightShift to bring it back.", "info", 3)
+        task.defer(function()
+            if _G.__BABFT_SETVISIBLE then
+                _G.__BABFT_SETVISIBLE(false)
+            end
+        end)
+    end,
+    {
+        color = rgb(48, 45, 80), radius = 12, textSize = 12,
+        tip = { "Hide GUI", "Hides the window without closing it. Farming keeps running and a small HUD appears.", "RightShift" },
+    }
+)
+
+createButton(
+    winCard, "RESET SETTINGS TO DEFAULT",
+    UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 38),
+    function()
+        for k, v in pairs(defaults) do
+            settings[k] = v
+        end
+
+        for _, refresh in ipairs(refreshers) do
+            refresh()
+        end
+
+        saveSettings()
+        notify("Settings reset", "All options are back to their defaults.", "info", 2.5)
+    end,
+    {
+        color = rgb(72, 44, 70), radius = 12, textSize = 12,
+        tip = { "Reset settings", "Restores flight speed, flight time, respawn wait and all toggles to default." },
+    }
+)
+
+--------------------------------------------------------------------
+-- DATA PAGE
+--------------------------------------------------------------------
+local dataPage = pages.Data
+
+header(dataPage, "Data editor")
+
+textCard(
+    dataPage, "Client-side values",
+    "Press Display Player Data to list the values inside Player.Data. Click a value, type a new one and press Enter to change it. Edits happen on your client only, so the server (and what other players see) keeps the real value and may overwrite yours."
+)
+
+local dataCard = createCard(dataPage, 0, true)
+padding(dataCard, 12, 12, 12, 12)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, dataCard)
+
+local dataCount = label(dataCard, "No data loaded yet.", UDim2.new(), UDim2.new(1, 0, 0, 20), 12, C.muted)
+dataCount.LayoutOrder = 2
+
+local dataList = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    LayoutOrder = 3,
+}, dataCard)
+new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, dataList)
+
+local dataConns = {}
+
+local function clearDataConns()
+    for _, c in ipairs(dataConns) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    dataConns = {}
+end
+
+local function refreshData()
+    clearDataConns()
+
+    for _, child in ipairs(dataList:GetChildren()) do
+        if child:IsA("Frame") then
+            child:Destroy()
+        end
+    end
+
+    local data = player:FindFirstChild("Data")
+
+    if not data then
+        dataCount.Text = "Player.Data was not found."
+        notify("Data not found", "This game doesn't expose Player.Data.", "warn")
+        return
+    end
+
+    print("=== Player data ===")
+
+    local n = 0
+
+    for _, value in ipairs(data:GetDescendants()) do
+        if value:IsA("ValueBase") then
+            n += 1
+
+            if n > 60 then
+                break
+            end
+
+            print(value:GetFullName(), value.Value)
+
+            local row = new("Frame", {
+                Size = UDim2.new(1, 0, 0, 30),
+                BackgroundColor3 = n % 2 == 0 and rgb(31, 30, 51) or rgb(27, 26, 45),
+                BorderSizePixel = 0,
+                LayoutOrder = n,
+            }, dataList)
+            corner(row, 8)
+
+            label(row, value.Name, UDim2.fromOffset(10, 0), UDim2.new(0.45, -10, 1, 0), 11, C.sub)
+
+            -- Which kinds of values can be edited from here
+            local editable = value:IsA("NumberValue")
+                or value:IsA("IntValue")
+                or value:IsA("StringValue")
+                or value:IsA("BoolValue")
+
+            local box = new("TextBox", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -6, 0.5, 0),
+                Size = UDim2.new(0.55, -10, 0, 22),
+                BackgroundColor3 = rgb(40, 38, 64),
+                BorderSizePixel = 0,
+                Text = tostring(value.Value),
+                PlaceholderText = "value",
+                TextColor3 = editable and C.text or C.muted,
+                PlaceholderColor3 = C.muted,
+                TextSize = 11,
+                Font = Enum.Font.GothamSemibold,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                ClearTextOnFocus = false,
+                TextEditable = editable,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, row)
+            corner(box, 6)
+            padding(box, 0, 8, 0, 8)
+            local boxStroke = stroke(box, editable and C.accent or C.line, 1, 0.75)
+
+            table.insert(dataConns, box.Focused:Connect(function()
+                tween(boxStroke, 0.15, { Transparency = 0 })
+            end))
+
+            table.insert(dataConns, box.FocusLost:Connect(function(enterPressed)
+                tween(boxStroke, 0.2, { Transparency = 0.75 })
+
+                if not editable or not enterPressed then
+                    box.Text = tostring(value.Value)
+                    return
+                end
+
+                local text = box.Text
+                local ok = false
+
+                if value:IsA("NumberValue") then
+                    local num = tonumber(text)
+                    if num then
+                        ok = pcall(function()
+                            value.Value = num
+                        end)
+                    end
+                elseif value:IsA("IntValue") then
+                    local num = tonumber(text)
+                    if num then
+                        ok = pcall(function()
+                            value.Value = math.floor(num)
+                        end)
+                    end
+                elseif value:IsA("BoolValue") then
+                    local lowered = string.lower(text)
+                    if lowered == "true" or lowered == "1" or lowered == "false" or lowered == "0" then
+                        ok = pcall(function()
+                            value.Value = (lowered == "true" or lowered == "1")
+                        end)
+                    end
+                elseif value:IsA("StringValue") then
+                    ok = pcall(function()
+                        value.Value = text
+                    end)
+                end
+
+                box.Text = tostring(value.Value)
+
+                if ok then
+                    notify("Value updated", value.Name .. " = " .. tostring(value.Value) .. "  (local only)", "good", 2.5)
+                else
+                    notify("Invalid value", "Couldn't set " .. value.Name .. " to \"" .. text .. "\".", "warn", 2.5)
+                end
+            end))
+
+            -- keep the box in sync if the game changes the value while you're not typing
+            table.insert(dataConns, value.Changed:Connect(function()
+                if not box:IsFocused() then
+                    box.Text = tostring(value.Value)
+                end
+            end))
+        end
+    end
+
+    dataCount.Text = n .. " value(s) found. Click a value, type a new one and press Enter."
+end
+
+do
+    local refreshBtn = createButton(
+        dataCard, "DISPLAY PLAYER DATA",
+        UDim2.new(), UDim2.new(1, 0, 0, 34),
+        refreshData,
+        {
+            color = rgb(76, 61, 140), radius = 12, textSize = 12,
+            tip = { "Display player data", "Reads Player.Data and lists every value here with an input bar. Press the button again to reload the list." },
+        }
+    )
+    refreshBtn.LayoutOrder = 1
+end
+
+--------------------------------------------------------------------
+-- INFO PAGE
+--------------------------------------------------------------------
+local infoPage = pages.Info
+
+header(infoPage, "Guide")
+
+textCard(
+    infoPage, "How the farm works",
+    "1.  You're teleported to a start point above the map.\n"
+    .. "2.  You fly forward at the speed you chose for the set time.\n"
+    .. "3.  You're teleported to the chest at the end.\n"
+    .. "4.  Your character is reset, and after the respawn wait the loop repeats."
+)
+
+textCard(
+    infoPage, "Restart Mode",
+    "If farming is on but your gold hasn't gone up for 1 minute 20 seconds, the script:\n"
+    .. "1.  Stops the current farm loop.\n"
+    .. "2.  Resets your character and waits for the respawn.\n"
+    .. "3.  Starts farming again. Session stats are kept.\n"
+    .. "Turn this off in Settings > Auto-restart on stall."
+)
+
+textCard(
+    infoPage, "Tips",
+    "•  Hover any control for an explanation.\n"
+    .. "•  Lower the flight speed if you keep dying mid-run.\n"
+    .. "•  Raise respawn wait if runs start before you've loaded in.\n"
+    .. "•  Turn on Anti-AFK for long sessions.\n"
+    .. "•  Hide the GUI (RightShift) to get a small HUD instead of the full window.\n"
+    .. "•  Settings are saved automatically if your executor supports it."
+)
+
+textCard(
+    infoPage, "Hotkeys",
+    "RightShift  –  hide / show the window\nV  –  stop farming immediately"
+)
+
+textCard(
+    infoPage, "About",
+    "BABFT Farm GUI v7\nAnimated UI, tooltips, live stats, saved settings and a stall watchdog."
+)
+
+--------------------------------------------------------------------
+-- MINI HUD (replaces the old full-screen overlay)
+-- Only visible while farming AND the main GUI is hidden.
+-- It does not cover the screen and never blurs anything.
+--------------------------------------------------------------------
+overlay = new("Frame", {
+    Name = "FarmHud",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = rgb(6, 6, 12),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Visible = false,
+    Active = false, -- never block clicks / camera
+    ZIndex = 100,
+}, sg)
+
+local ovc = new("CanvasGroup", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    GroupTransparency = 1,
+}, overlay)
+
+local panel = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 1),
+    Position = UDim2.new(0.5, 0, 1, -24),
+    Size = UDim2.fromOffset(480, 400),
+    BackgroundColor3 = rgb(19, 17, 36),
+    BorderSizePixel = 0,
+}, ovc)
+corner(panel, 26)
+
+local HUD_SCALE = 0.8
+local panelScale = new("UIScale", { Scale = HUD_SCALE * 0.9 }, panel)
+local panelStroke = stroke(panel, C.accent, 1.5, 0.15)
+local panelStrokeGradient = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, C.accent),
+        ColorSequenceKeypoint.new(0.5, C.accent2),
+        ColorSequenceKeypoint.new(1, C.accent),
+    }),
+}, panelStroke)
+
+local badgeRing = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0, 58),
+    Size = UDim2.fromOffset(60, 60),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+}, panel)
+circle(badgeRing)
+local badgeRingStroke = stroke(badgeRing, C.accent, 2, 0.4)
+
+local badge = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0, 58),
+    Size = UDim2.fromOffset(58, 58),
+    BackgroundColor3 = rgb(74, 58, 135),
+    BorderSizePixel = 0,
+}, panel)
+corner(badge, 22)
+gradient(badge, rgb(110, 84, 205), rgb(64, 96, 190), 45)
+
+label(badge, "⚓", UDim2.new(), UDim2.fromScale(1, 1), 30, Color3.new(1, 1, 1), Enum.Font.Gotham, Enum.TextXAlignment.Center)
+
+label(
+    panel, "CURRENTLY FARMING", UDim2.fromOffset(20, 106), UDim2.new(1, -40, 0, 30),
+    22, C.text, Enum.Font.GothamBold, Enum.TextXAlignment.Center
+)
+
+local ovPhase = label(
+    panel, "STARTING", UDim2.fromOffset(20, 136), UDim2.new(1, -40, 0, 18),
+    11, rgb(167, 152, 220), Enum.Font.GothamSemibold, Enum.TextXAlignment.Center
+)
+
+local ovTrack = new("Frame", {
+    Position = UDim2.fromOffset(44, 166),
+    Size = UDim2.new(1, -88, 0, 6),
+    BackgroundColor3 = rgb(45, 42, 70),
+    BorderSizePixel = 0,
+}, panel)
+circle(ovTrack)
+
+local ovFill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BackgroundColor3 = C.accent,
+    BorderSizePixel = 0,
+}, ovTrack)
+circle(ovFill)
+FX.ovShimmer = FX.shimmer(ovFill)
+
+local ovTime, ovRuns, ovGold
+
+local function ovTile(index, title, color)
+    local tile = new("Frame", {
+        Position = UDim2.new((index - 1) / 3, index == 1 and 24 or 6, 0, 192),
+        Size = UDim2.new(1 / 3, -16, 0, 78),
+        BackgroundColor3 = C.card,
+        BorderSizePixel = 0,
+    }, panel)
+    corner(tile, 14)
+    stroke(tile, C.line, 1, 0.65)
+
+    label(tile, title, UDim2.new(), UDim2.new(1, 0, 0, 28), 10, C.muted, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    return label(tile, "0", UDim2.fromOffset(0, 26), UDim2.new(1, 0, 0, 40), 21, color, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+end
+
+ovTime = ovTile(1, "TIME", C.text)
+ovRuns = ovTile(2, "RUNS", C.accent)
+ovGold = ovTile(3, "GOLD", C.warn)
+
+for _, l in ipairs({ heroRuns, statRuns, ovRuns }) do
+    table.insert(FX.runScales, new("UIScale", { Scale = 1 }, l))
+end
+
+for _, l in ipairs({ heroGold, statGold, ovGold }) do
+    table.insert(FX.goldScales, new("UIScale", { Scale = 1 }, l))
+end
+
+local ovRate = label(
+    panel, "0 gold / hour", UDim2.fromOffset(20, 282), UDim2.new(1, -40, 0, 22),
+    12, C.sub, Enum.Font.GothamSemibold, Enum.TextXAlignment.Center
+)
+
+createButton(
+    panel, "■   STOP FARMING",
+    UDim2.fromOffset(140, 314), UDim2.fromOffset(200, 44),
+    function()
+        if state.farming and _G.__BABFT_STOP then
+            _G.__BABFT_STOP()
+        end
+    end,
+    {
+        color = rgb(113, 43, 67), hover = rgb(165, 48, 82), radius = 22, textSize = 12,
+        outline = rgb(235, 99, 139),
+        tip = { "Stop farming", "Stops the loop and brings the GUI back.", "V" },
+    }
+)
+
+label(
+    panel, "or press  V   •   RightShift shows the GUI", UDim2.fromOffset(20, 368), UDim2.new(1, -40, 0, 16),
+    11, rgb(130, 120, 165), Enum.Font.Gotham, Enum.TextXAlignment.Center
+)
+
+local function showHud()
+    hudShown = true
+    overlay.Visible = true
+
+    tween(overlay, 0.4, { BackgroundTransparency = settings.dim and 0.55 or 1 })
+    tween(ovc, 0.45, { GroupTransparency = 0 })
+
+    panelScale.Scale = HUD_SCALE * 0.9
+    tween(panelScale, 0.5, { Scale = HUD_SCALE }, Enum.EasingStyle.Back)
+end
+
+local function hideHud()
+    hudShown = false
+
+    tween(overlay, 0.3, { BackgroundTransparency = 1 })
+    tween(ovc, 0.25, { GroupTransparency = 1 })
+    tween(panelScale, 0.3, { Scale = HUD_SCALE * 0.92 })
+
+    task.delay(0.4, function()
+        if not hudShown and overlay.Parent then
+            overlay.Visible = false
+        end
+    end)
+end
+
+local function updateHud()
+    local want = state.farming and state.guiHidden
+
+    if want and not hudShown then
+        showHud()
+    elseif not want and hudShown then
+        hideHud()
+    end
+end
+
+--------------------------------------------------------------------
+-- STATUS + FARM LOGIC
+--------------------------------------------------------------------
+local function setStatus(text, color)
+    setText(statusLabel, "Status: " .. text)
+    setText(pillText, text)
+    tween(statusDot, 0.25, { BackgroundColor3 = color })
+    tween(pillDot, 0.25, { BackgroundColor3 = color })
+    statusGlow.BackgroundColor3 = color
+end
+
+local function setPhase(text, progress)
+    state.phase = text
+    state.phaseProgress = progress or 0
+end
+
+local function cleanupFlight()
+    if currentVelocity then
+        pcall(function()
+            currentVelocity:Destroy()
+        end)
+        currentVelocity = nil
+    end
+
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+end
+
+local function stopFarm(silent)
+    if not state.farming then
+        return
+    end
+
+    state.farming = false
+    state.restarting = false
+    state.farmId += 1
+    state.sessionId += 1
+    state.sessionElapsed = tick() - state.farmStart
+
+    cleanupFlight()
+
+    setStatus("Idle", C.muted)
+    setPhase("Idle", 0)
+
+    startBtn.Text = "START FARMING"
+    setStartColors(rgb(100, 74, 200), rgb(126, 92, 235), rgb(165, 140, 255))
+
+    updateHud()
+
+    if not silent then
+        -- bring the GUI back if it was hidden
+        if state.guiHidden and _G.__BABFT_SETVISIBLE then
+            _G.__BABFT_SETVISIBLE(true)
+        end
+
+        notify(
+            "Farming stopped",
+            comma(state.runs) .. " runs  •  +" .. comma(state.earned) .. " gold",
+            "info", 3.5
+        )
+    end
+end
+
+_G.__BABFT_STOP = stopFarm
+
+-- Polls until a fresh, living character exists (or timeout / farm stopped).
+-- `oldCharacter` is ignored when matching so we don't return the corpse we just killed.
+local function waitForCharacter(alive, oldCharacter, timeout)
+    local t0 = tick()
+
+    while alive() and tick() - t0 < timeout do
+        local c = player.Character
+
+        if c and c ~= oldCharacter and c.Parent then
+            local h = c:FindFirstChildOfClass("Humanoid")
+            local r = c:FindFirstChild("HumanoidRootPart")
+
+            if h and r and h.Health > 0 then
+                return c
+            end
+        end
+
+        task.wait(0.2)
+    end
+
+    return nil
+end
+
+-- One full fly -> chest -> reset cycle. Wrapped in pcall by the caller.
+local function runCycle(alive)
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if not character or not character.Parent or not humanoid or humanoid.Health <= 0 then
+        local corpse = nil
+
+        if character and (not character.Parent or (humanoid and humanoid.Health <= 0)) then
+            corpse = character
+        end
+
+        setPhase("Waiting for respawn", 0)
+        character = waitForCharacter(alive, corpse, 25)
+
+        if not alive() then
+            return
+        end
+
+        if not character then
+            task.wait(1)
+            return
+        end
+
+        task.wait(0.5)
+    end
+
+    local hrp = character:WaitForChild("HumanoidRootPart", 5)
+
+    if not hrp then
+        task.wait(1)
+        return
+    end
+
+    -- 1) Teleport to start
+    setPhase("Teleporting to start", 0)
+
+    pcall(function()
+        hrp.CFrame = CFrame.new(centerPosition)
+    end)
+
+    task.wait(0.2)
+
+    if not alive() then
+        return
+    end
+
+    -- 2) Fly
+    setPhase("Flying", 0)
+
+    local velocity = Instance.new("BodyVelocity")
+    velocity.Name = "BABFTFarmVelocity"
+    velocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    velocity.Velocity = Vector3.new(0, 0, settings.flySpeed)
+    velocity.Parent = hrp
+    currentVelocity = velocity
+
+    local flightStart = tick()
+
+    while alive() and tick() - flightStart < settings.flyDuration do
+        if not hrp.Parent then
+            break
+        end
+
+        velocity.Velocity = Vector3.new(0, 0, settings.flySpeed)
+        setPhase("Flying", (tick() - flightStart) / settings.flyDuration)
+        task.wait(0.1)
+    end
+
+    pcall(function()
+        velocity:Destroy()
+    end)
+
+    if currentVelocity == velocity then
+        currentVelocity = nil
+    end
+
+    if not alive() then
+        return
+    end
+
+    -- 3) Chest
+    setPhase("Collecting chest", 1)
+
+    pcall(function()
+        hrp.CFrame = CFrame.new(chestPosition)
+    end)
+
+    task.wait(0.3)
+
+    if not alive() then
+        return
+    end
+
+    -- 4) Reset
+    pcall(function()
+        character:BreakJoints()
+    end)
+
+    state.runs += 1
+
+    local respawnStart = tick()
+
+    while alive() and tick() - respawnStart < settings.respawnWait do
+        setPhase("Respawning", (tick() - respawnStart) / settings.respawnWait)
+        task.wait(0.1)
+    end
+
+    if not alive() then
+        return
+    end
+
+    -- Record gold for this run
+    local goldNow = getGoldValue()
+    local current = goldNow and tonumber(goldNow.Value) or state.lastRunGold
+    local delta = math.max(0, current - state.lastRunGold)
+
+    state.lastRunGold = current
+    state.bestRun = math.max(state.bestRun, delta)
+
+    table.insert(goldHistory, delta)
+    renderSparkline()
+
+    notify("Run " .. state.runs .. " complete", "+" .. comma(delta) .. " gold", "good", 2.2)
+end
+
+-- Starts (or restarts) the farm loop thread. Safe to call repeatedly: any previous loop is invalidated.
+local function launchLoop()
+    state.farmId += 1
+    local myId = state.farmId
+
+    local function alive()
+        return state.farming and state.farmId == myId
+    end
+
+    cleanupFlight()
+
+    noclipConnection = RunService.Stepped:Connect(function()
+        if not alive() then
+            return
+        end
+
+        local character = player.Character
+
+        if character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while alive() do
+            local ok, err = pcall(runCycle, alive)
+
+            if not ok then
+                warn("[BABFT V7] farm cycle error: " .. tostring(err))
+                setPhase("Recovering", 0)
+
+                pcall(function()
+                    if currentVelocity then
+                        currentVelocity:Destroy()
+                        currentVelocity = nil
+                    end
+                end)
+
+                task.wait(1)
+            end
+
+            task.wait() -- never spin without yielding
+        end
+
+        if state.farmId == myId then
+            cleanupFlight()
+        end
+    end)
+end
+
+-- RESTART MODE: stop the loop, reset the character, wait for respawn, start again.
+local function restartFarm(reason)
+    if not state.farming or state.restarting then
+        return
+    end
+
+    state.restarting = true
+    local mySession = state.sessionId
+
+    local function stillMine()
+        return state.farming and state.sessionId == mySession
+    end
+
+    -- 1) stop the current autofarm loop
+    state.farmId += 1
+    cleanupFlight()
+    state.restarts += 1
+
+    setStatus("Restart Mode", C.warn)
+    setPhase("Restart Mode", 0.1)
+
+    notify(
+        "Restart Mode",
+        reason or "No new gold for 1m 20s. Restarting the farm.",
+        "warn", 4
+    )
+
+    task.wait(0.5)
+
+    if not stillMine() then
+        return
+    end
+
+    -- 2) reset the player
+    setPhase("Restart Mode: resetting", 0.35)
+
+    local old = player.Character
+
+    pcall(function()
+        if old then
+            local h = old:FindFirstChildOfClass("Humanoid")
+
+            if h then
+                h.Health = 0
+            end
+
+            old:BreakJoints()
+        end
+    end)
+
+    local fresh = waitForCharacter(stillMine, old, 25)
+
+    if not stillMine() then
+        return
+    end
+
+    setPhase("Restart Mode: respawning", 0.65)
+
+    local waitStart = tick()
+
+    while stillMine() and tick() - waitStart < settings.respawnWait do
+        task.wait(0.1)
+    end
+
+    if not stillMine() then
+        return
+    end
+
+    if not fresh then
+        warn("[BABFT V7] Restart Mode: character did not respawn in time, resuming anyway.")
+    end
+
+    -- 3) start farming again (session stats are kept)
+    local goldObject = getGoldValue()
+    local current = goldObject and tonumber(goldObject.Value) or state.lastSeenGold
+
+    state.lastRunGold = current
+    state.lastGoldChange = tick()
+    state.restarting = false
+
+    setStatus("Farming", C.good)
+    setPhase("Starting", 0)
+
+    launchLoop()
+end
+
+local function startFarm()
+    if state.farming then
+        return
+    end
+
+    state.farming = true
+    state.restarting = false
+    state.farmId += 1
+    state.sessionId += 1
+    local mySession = state.sessionId
+
+    state.farmStart = tick()
+    state.sessionElapsed = 0
+    state.runs = 0
+    state.restarts = 0
+    state.earned = 0
+    state.bestRun = 0
+    goldHistory = {}
+    renderSparkline()
+
+    local gold = getGoldValue()
+    state.goldStart = gold and tonumber(gold.Value) or 0
+    state.lastRunGold = state.goldStart
+    state.lastSeenGold = state.goldStart
+    state.lastGoldChange = tick()
+
+    if not gold then
+        notify("Gold not detected", "Player.Data.Gold wasn't found, so gold stats and the stall watchdog are disabled.", "warn", 4)
+    end
+
+    setStatus("Farming", C.good)
+    setPhase("Starting", 0)
+
+    startBtn.Text = "STOP FARMING"
+    setStartColors(rgb(150, 50, 80), rgb(190, 60, 98), rgb(235, 99, 139))
+
+    updateHud()
+    notify("Farming started", "Press V to stop. RightShift hides the GUI and shows a mini HUD.", "good", 3.5)
+
+    launchLoop()
+
+    -- Stall watchdog: no new gold for STALL_TIMEOUT seconds -> Restart Mode
+    task.spawn(function()
+        while state.farming and state.sessionId == mySession do
+            task.wait(1)
+
+            if state.farming
+                and state.sessionId == mySession
+                and not state.restarting
+                and settings.autoRestart
+                and getGoldValue() ~= nil
+                and tick() - state.lastGoldChange >= STALL_TIMEOUT then
+                restartFarm("No new gold for 1m 20s. Stopping, resetting and restarting.")
+            end
+        end
+    end)
+end
+
+toggleFarm = function()
+    if state.farming then
+        stopFarm()
+    else
+        startFarm()
+    end
+end
+
+--------------------------------------------------------------------
+-- ANTI AFK
+--------------------------------------------------------------------
+connect(player.Idled, function()
+    if settings.antiAfk then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end
+end)
+
+--------------------------------------------------------------------
+-- WINDOW BEHAVIOUR (drag / minimize / hide / close)
+--------------------------------------------------------------------
+local draggingWindow = false
+local dragStart, startPosition
+
+connect(topbar.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        draggingWindow = true
+        dragStart = input.Position
+        startPosition = main.Position
+    end
+end)
+
+local guiToken = 0
+
+local function setGuiVisible(visible)
+    state.guiHidden = not visible
+    guiToken += 1
+    local token = guiToken
+
+    hideTip()
+
+    if visible then
+        main.Visible = true
+        tween(main, 0.35, { GroupTransparency = 0 })
+        tween(mainScale, 0.45, { Scale = baseScale }, Enum.EasingStyle.Back)
+    else
+        tween(main, 0.2, { GroupTransparency = 1 })
+        tween(mainScale, 0.25, { Scale = baseScale * 0.92 })
+
+        task.delay(0.25, function()
+            if token == guiToken then
+                main.Visible = false
+            end
+        end)
+    end
+
+    updateHud()
+end
+
+_G.__BABFT_SETVISIBLE = setGuiVisible
+
+local minToken = 0
+
+connect(minimizeBtn.Activated, function()
+    state.minimized = not state.minimized
+    minToken += 1
+    local token = minToken
+    hideTip()
+
+    local dy = (FULL_H - MIN_H) / 2
+
+    if state.minimized then
+        tween(main, 0.4, {
+            Size = UDim2.fromOffset(FULL_W, MIN_H),
+            Position = UDim2.new(main.Position.X.Scale, main.Position.X.Offset, main.Position.Y.Scale, main.Position.Y.Offset - dy),
+        }, Enum.EasingStyle.Quint)
+
+        tween(sidebar, 0.15, { Position = UDim2.fromOffset(12, 90) })
+
+        task.delay(0.3, function()
+            if token == minToken then
+                sidebar.Visible = false
+                pageHolder.Visible = false
+            end
+        end)
+
+        minimizeBtn.Text = "+"
+    else
+        sidebar.Visible = true
+        pageHolder.Visible = true
+        sidebar.Position = UDim2.fromOffset(12, 72)
+
+        tween(main, 0.4, {
+            Size = UDim2.fromOffset(FULL_W, FULL_H),
+            Position = UDim2.new(main.Position.X.Scale, main.Position.X.Offset, main.Position.Y.Scale, main.Position.Y.Offset + dy),
+        }, Enum.EasingStyle.Quint)
+
+        minimizeBtn.Text = "—"
+    end
+end)
+
+connect(closeBtn.Activated, function()
+    stopFarm(true)
+    hideTip()
+
+    tween(main, 0.25, { GroupTransparency = 1 })
+    tween(mainScale, 0.25, { Scale = baseScale * 0.85 }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+
+    task.wait(0.3)
+
+    cleanupFlight()
+
+    for _, c in ipairs(connections) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+
+    _G.__BABFT_STOP = nil
+    _G.__BABFT_SETVISIBLE = nil
+
+    sg:Destroy()
+    sgTop:Destroy()
+end)
+
+--------------------------------------------------------------------
+-- INPUT
+--------------------------------------------------------------------
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed then
+        return
+    end
+
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        setGuiVisible(state.guiHidden)
+    elseif input.KeyCode == Enum.KeyCode.V then
+        if state.farming then
+            stopFarm()
+        end
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+
+    if activeSlider and isMove then
+        activeSlider.update(input.Position.X)
+    end
+
+    if draggingWindow and isMove and dragStart then
+        local delta = input.Position - dragStart
+
+        main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        draggingWindow = false
+
+        if activeSlider then
+            tween(activeSlider.knob, 0.25, { Size = UDim2.fromOffset(16, 16) }, Enum.EasingStyle.Back)
+            activeSlider = nil
+            saveSettings()
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- RENDER LOOP (animations + live stats)
+--------------------------------------------------------------------
+local startClock = tick()
+local shownGold = 0
+local shownProgress = 0
+local lastPhase = ""
+local goldAccumulator = 0
+local fpsAccumulator, fpsFrames = 0, 0
+
+local phaseColors = {
+    ["Flying"] = C.accent,
+    ["Collecting chest"] = C.good,
+    ["Respawning"] = C.warn,
+    ["Waiting for respawn"] = C.warn,
+    ["Teleporting to start"] = C.accent2,
+    ["Starting"] = C.accent2,
+    ["Recovering"] = C.warn,
+    ["Restart Mode"] = C.warn,
+    ["Restart Mode: resetting"] = C.bad,
+    ["Restart Mode: respawning"] = C.warn,
+    ["Idle"] = C.muted,
+}
+
+connect(RunService.Heartbeat, function(dt)
+    local t = tick() - startClock
+
+    -- Animated gradients
+    mainStrokeGradient.Rotation = (t * 35) % 360
+    accentLineGradient.Offset = Vector2.new(math.sin(t * 0.9) * 0.45, 0)
+
+    -- Extra ambient animation
+    for _, o in ipairs(FX.orbs) do
+        o.obj.Position = UDim2.fromScale(
+            0.5 + 0.55 * math.sin(t * o.sx + o.px),
+            0.5 + 0.55 * math.sin(t * o.sy + o.py)
+        )
+        o.obj.BackgroundTransparency = 0.88 + 0.06 * math.sin(t * 0.7 + o.px)
+    end
+
+    FX.titleGradient.Offset = Vector2.new(math.sin(t * 1.1) * 0.5, 0)
+    FX.heroGradient.Rotation = (120 + t * (state.farming and 60 or 15)) % 360
+
+    local shimmerOffset = Vector2.new(((t * (state.farming and 1.1 or 0.5)) % 2) - 1, 0)
+    FX.heroShimmer.Offset = shimmerOffset
+    FX.ovShimmer.Offset = shimmerOffset
+
+    -- Counter "pop" when runs / gold change
+    if state.runs ~= FX.lastRuns then
+        FX.lastRuns = state.runs
+
+        if state.runs > 0 then
+            for _, sc in ipairs(FX.runScales) do
+                sc.Scale = 1.3
+                tween(sc, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+            end
+        end
+    end
+
+    if state.earned > FX.lastEarned then
+        for _, sc in ipairs(FX.goldScales) do
+            sc.Scale = 1.18
+            tween(sc, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+        end
+    end
+
+    FX.lastEarned = state.earned
+
+    -- Tooltip follows cursor
+    if tip.Visible then
+        local mouse = UserInputService:GetMouseLocation()
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        local size = tip.AbsoluteSize
+
+        local x = math.min(mouse.X + 16, vp.X - size.X - 8)
+        local y = mouse.Y + 22
+
+        if y + size.Y > vp.Y - 8 then
+            y = mouse.Y - size.Y - 12
+        end
+
+        tip.Position = UDim2.fromOffset(math.max(8, x), math.max(8, y))
+    end
+
+    -- FPS
+    fpsAccumulator += dt
+    fpsFrames += 1
+
+    if fpsAccumulator >= 0.5 then
+        setText(sideFps, "FPS  " .. math.floor(fpsFrames / fpsAccumulator + 0.5))
+        fpsAccumulator, fpsFrames = 0, 0
+    end
+
+    -- Gold polling (4x per second)
+    goldAccumulator += dt
+
+    if goldAccumulator >= 0.25 then
+        goldAccumulator = 0
+
+        local goldObject = getGoldValue()
+        local current = goldObject and tonumber(goldObject.Value)
+
+        setText(sideGold, current and comma(current) or "—")
+
+        if state.farming and current then
+            if current > state.lastSeenGold then
+                -- gold went up: count it and reset the stall watchdog timer
+                state.earned += current - state.lastSeenGold
+                state.lastGoldChange = tick()
+            end
+
+            state.lastSeenGold = current
+        end
+    end
+
+    -- Status glow pulse
+    if state.farming then
+        local pulse = (math.sin(t * 4) + 1) / 2
+        local size = 9 + pulse * 16
+        statusGlow.Size = UDim2.fromOffset(size, size)
+        statusGlow.BackgroundTransparency = 0.55 + pulse * 0.45
+    else
+        statusGlow.BackgroundTransparency = 1
+    end
+
+    -- Smooth counters + progress
+    shownGold += (state.earned - shownGold) * math.clamp(dt * 7, 0, 1)
+
+    if math.abs(state.earned - shownGold) < 0.5 then
+        shownGold = state.earned
+    end
+
+    local elapsed = state.farming and (tick() - state.farmStart) or state.sessionElapsed
+    local timeText = formatTime(elapsed)
+    local goldText = comma(shownGold)
+    local runsText = tostring(state.runs)
+    local rate = elapsed > 5 and state.earned * 3600 / elapsed or 0
+    local avg = state.runs > 0 and state.earned / state.runs or 0
+
+    setText(heroTime, timeText)
+    setText(heroRuns, runsText)
+    setText(heroGold, goldText)
+
+    setText(statTime, timeText)
+    setText(statGold, goldText)
+    setText(statRuns, runsText)
+    setText(statRate, comma(rate))
+    setText(statAvg, comma(avg))
+    setText(statBest, tostring(state.restarts))
+
+    setText(ovTime, timeText)
+    setText(ovRuns, runsText)
+    setText(ovGold, "+" .. goldText)
+    setText(ovRate, comma(rate) .. " gold / hour  •  " .. state.restarts .. " restart" .. (state.restarts == 1 and "" or "s"))
+
+    shownProgress += (state.phaseProgress - shownProgress) * math.clamp(dt * 10, 0, 1)
+    local progressSize = UDim2.new(math.clamp(shownProgress, 0, 1), 0, 1, 0)
+    heroFill.Size = progressSize
+    ovFill.Size = progressSize
+
+    if state.phase ~= lastPhase then
+        lastPhase = state.phase
+        local color = phaseColors[state.phase] or C.accent
+
+        tween(heroFill, 0.3, { BackgroundColor3 = color })
+        tween(ovFill, 0.3, { BackgroundColor3 = color })
+        setText(phaseLabel, state.phase)
+        setText(ovPhase, string.upper(state.phase))
+    end
+
+    -- HUD animation (only while it's showing)
+    if hudShown then
+        panelStrokeGradient.Rotation = (t * 60) % 360
+
+        local pulse = (math.sin(t * 2.5) + 1) / 2
+        local ringSize = 62 + pulse * 22
+        badgeRing.Size = UDim2.fromOffset(ringSize, ringSize)
+        badgeRingStroke.Transparency = 0.25 + pulse * 0.75
+        badge.Rotation = math.sin(t * 1.5) * 4
+        panel.Position = UDim2.new(0.5, 0, 1, -24 + math.sin(t * 1.6) * 3)
+    end
+end)
+
+--------------------------------------------------------------------
+-- STARTUP
+--------------------------------------------------------------------
+renderSparkline()
+selectTab("Farm", true)
+FX.stagger("Farm")
+
+tabButtons.Farm.TextColor3 = Color3.new(1, 1, 1)
+
+main.Visible = true
+tween(main, 0.6, { GroupTransparency = 0 })
+tween(mainScale, 0.7, { Scale = baseScale }, Enum.EasingStyle.Back)
+
+task.delay(0.6, function()
+    notify("BABFT V7 loaded", "RightShift hides the GUI. Hover anything for help.", "info", 4)
+end)
+
+print("[BABFT V7] GUI loaded.")
